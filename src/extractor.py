@@ -5,7 +5,9 @@ Gemini API에 Markdown을 주입하여 정형화된 JSON(ArticleInsight)을 추�
 JSON 파싱 실패 시 에러 메시지를 포함한 교정 요청을 최대 2회 수행합니다.
 """
 
+import asyncio as _asyncio
 import json
+import re as _re
 
 import google.generativeai as genai
 from pydantic import ValidationError
@@ -14,9 +16,10 @@ from config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
     GEMINI_MAX_CORRECTION_RETRIES,
+    RETRY_MAX_ATTEMPTS,
 )
 from schemas import ArticleInsight
-from src.utils import api_retry_decorator, RateLimitError, TransientAPIError, setup_logger
+from src.utils import RateLimitError, TransientAPIError, setup_logger
 
 logger = setup_logger("aidaily.extractor")
 
@@ -57,36 +60,93 @@ CORRECTION_PROMPT = """\
 """
 
 
-@api_retry_decorator()
+def _parse_retry_delay(error_msg: str) -> float | None:
+    """
+    Gemini 429 에러 메시지에서 retry_delay 초를 파싱합니다.
+
+    에러 메시지 예시:
+        ... retry_delay { seconds: 43 } ...
+        ... Please retry in 43.231984083s ...
+    """
+    # 패턴 1: retry_delay { seconds: N }
+    match = _re.search(r"retry_delay\s*\{[^}]*seconds:\s*(\d+)", error_msg)
+    if match:
+        return float(match.group(1))
+
+    # 패턴 2: Please retry in N.NNNs
+    match = _re.search(r"retry in\s+([\d.]+)s", error_msg)
+    if match:
+        return float(match.group(1))
+
+    return None
+
+
 async def _call_gemini(prompt: str) -> str:
     """
     Gemini API를 호출하고 텍스트 응답을 반환합니다.
-    Rate Limit(429), 서버 과부하(503) 시 재시도 가능한 예외를 발생시킵니다.
+
+    Rate Limit(429) 시 서버가 알려주는 retry_delay만큼 정확히 대기한 뒤 재시도합니다.
+    tenacity의 blind backoff 대신, 서버 지시 대기 시간을 준수하여 재시도 횟수를 절약합니다.
     """
     model = genai.GenerativeModel(
         GEMINI_MODEL,
         generation_config=genai.GenerationConfig(
             response_mime_type="application/json",
-            temperature=0.1,  # 정형 추출이므로 낮은 temperature
+            temperature=0.1,
         ),
     )
-    try:
-        response = await model.generate_content_async(prompt)
 
-        if not response or not response.text:
-            raise TransientAPIError("[Gemini] 빈 응답이 반환되었습니다.")
+    last_error = None
 
-        return response.text
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            response = await model.generate_content_async(prompt)
 
-    except Exception as e:
-        error_str = str(e).lower()
-        if "429" in error_str or "resource_exhausted" in error_str:
-            raise RateLimitError(f"[Gemini] Rate Limit 초과: {e}")
-        if "503" in error_str or "overloaded" in error_str:
-            raise TransientAPIError(f"[Gemini] 서버 과부하: {e}")
-        if "deadline" in error_str or "timeout" in error_str:
-            raise TransientAPIError(f"[Gemini] 타임아웃: {e}")
-        raise
+            if not response or not response.text:
+                raise TransientAPIError("[Gemini] 빈 응답이 반환되었습니다.")
+
+            return response.text
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            error_lower = error_str.lower()
+
+            is_rate_limit = "429" in error_lower or "resource_exhausted" in error_lower
+            is_transient = "503" in error_lower or "overloaded" in error_lower
+            is_timeout = "deadline" in error_lower or "timeout" in error_lower
+
+            if not (is_rate_limit or is_transient or is_timeout):
+                # 재시도 불가능한 에러 → 즉시 raise
+                raise
+
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                break  # 마지막 시도 → 루프 탈출 후 에러 raise
+
+            # retry_delay 파싱 (Rate Limit인 경우)
+            if is_rate_limit:
+                server_delay = _parse_retry_delay(error_str)
+                if server_delay and server_delay > 0:
+                    # 서버가 알려준 대기 시간 + 2초 여유
+                    wait_seconds = server_delay + 2
+                    logger.warning(
+                        f"[Gemini] Rate Limit (시도 {attempt}/{RETRY_MAX_ATTEMPTS}). "
+                        f"서버 지시 대기: {server_delay:.0f}초 (+2초 여유 = {wait_seconds:.0f}초)"
+                    )
+                    await _asyncio.sleep(wait_seconds)
+                    continue
+
+            # retry_delay 파싱 실패 또는 transient/timeout → 기본 exponential backoff
+            fallback_wait = min(4 * (2 ** (attempt - 1)), 60)
+            error_type = "Rate Limit" if is_rate_limit else ("서버 과부하" if is_transient else "타임아웃")
+            logger.warning(
+                f"[Gemini] {error_type} (시도 {attempt}/{RETRY_MAX_ATTEMPTS}). "
+                f"대기: {fallback_wait}초 (fallback)"
+            )
+            await _asyncio.sleep(fallback_wait)
+
+    # 모든 재시도 소진
+    raise RateLimitError(f"[Gemini] {RETRY_MAX_ATTEMPTS}회 재시도 모두 실패: {last_error}")
 
 
 def _parse_insight(raw_json: str) -> ArticleInsight:
