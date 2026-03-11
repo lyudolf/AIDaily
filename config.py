@@ -44,7 +44,7 @@ JINA_TIMEOUT_SECONDS: int = 30
 # ──────────────────────────────────────────────
 # Gemini API
 # ──────────────────────────────────────────────
-GEMINI_MODEL: str = "gemini-2.0-flash"
+GEMINI_MODEL: str = "gemini-2.5-flash"
 GEMINI_TIMEOUT_SECONDS: int = 60  # 무료 티어 지연 대응: 60초
 GEMINI_MAX_CORRECTION_RETRIES: int = 2  # JSON 파싱 실패 시 교정 재시도 횟수
 
