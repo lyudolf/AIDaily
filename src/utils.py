@@ -41,14 +41,32 @@ from config import (
 
 
 # ──────────────────────────────────────────────
-# 로깅 설정
+# 로깅 설정 (Windows cp949 안전 처리)
 # ──────────────────────────────────────────────
+class _SafeStreamHandler(logging.StreamHandler):
+    """Windows cp949 인코딩에서 UnicodeEncodeError를 방지하는 핸들러."""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            try:
+                stream.write(msg + self.terminator)
+            except UnicodeEncodeError:
+                # cp949로 인코딩 불가능한 문자(en-dash, 특수기호 등)를 ?로 대체
+                safe_msg = msg.encode("cp949", errors="replace").decode("cp949")
+                stream.write(safe_msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logger(name: str = "aidaily") -> logging.Logger:
     """포맷 통일된 공용 로거를 생성합니다."""
     logger = logging.getLogger(name)
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        handler = logging.StreamHandler(sys.stdout)
+        handler = _SafeStreamHandler(sys.stdout)
         handler.setLevel(logging.INFO)
         formatter = logging.Formatter(
             "[%(asctime)s] %(levelname)-7s | %(name)-18s | %(message)s",

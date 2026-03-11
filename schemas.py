@@ -38,3 +38,29 @@ class ArticleInsight(BaseModel):
             "어떤 파급 효과를 주는지 기획자 관점에서 작성한 3줄 심층 분석"
         )
     )
+
+
+class KoreanBriefing(BaseModel):
+    """Step 3.5: 한글 브리핑 — 요약 + 가이드 질문."""
+
+    summary_kr: str = Field(
+        description="기사 핵심 내용을 한국어 3~4줄로 요약"
+    )
+    guide_questions: list[str] = Field(
+        description="사용자가 의견을 작성할 수 있도록 돕는 기획자 관점 한국어 질문 3개"
+    )
+
+
+class MediumDraft(BaseModel):
+    """Step 5: 영문 Medium 블로그 초안."""
+
+    title: str = Field(
+        description="Medium 블로그 포스트 영문 제목"
+    )
+    body_markdown: str = Field(
+        description="900~1200 words 영문 블로그 본문 (Markdown)"
+    )
+    tags: list[str] = Field(
+        default_factory=list,
+        description="Medium 태그 (최대 5개, 영문)"
+    )

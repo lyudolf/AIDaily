@@ -1,15 +1,19 @@
 """
 main.py — 전체 파이프라인 오케스트레이션 엔트리포인트
 
-URL 리스트를 입력받아 Step 1→2→3을 순차 실행합니다.
-개별 URL 실패 시 파이프라인을 중단하지 않고 스킵합니다.
+하루 1회 실행으로 두 가지 작업을 순차 처리합니다:
+  Phase A: 새 URL 수집 → 인사이트 추출 → Notion 적재 → 한글 브리핑 생성
+  Phase B: 코멘트 작성 완료된 글의 영문 블로그 초안 자동 생성
 
 Usage:
     # urls.yaml 파일 사용
     python main.py
 
     # CLI 인자로 URL 직접 전달
-    python main.py --urls "https://example.com/article1" "https://example.com/article2"
+    python main.py --urls "https://example.com/article1"
+
+    # Phase B만 실행 (초안 생성만)
+    python main.py --draft-only
 """
 
 import argparse
@@ -20,9 +24,19 @@ from pathlib import Path
 import yaml
 
 from config import validate_env, REQUEST_DELAY_SECONDS
+from schemas import ArticleInsight
 from src.scraper import fetch_markdown
 from src.extractor import extract_insights
-from src.notion_publisher import publish_to_notion, check_duplicate
+from src.briefing_generator import generate_briefing
+from src.draft_composer import compose_draft
+from src.notion_publisher import (
+    publish_to_notion,
+    check_duplicate,
+    update_briefing,
+    fetch_ready_pages,
+    fetch_page_blocks,
+    save_draft_to_page,
+)
 from src.utils import setup_logger
 
 logger = setup_logger("aidaily.main")
@@ -51,18 +65,16 @@ def load_urls_from_yaml(filepath: str = "urls.yaml") -> list[str]:
     return [str(url).strip() for url in urls if url]
 
 
+# ──────────────────────────────────────────────
+# Phase A: 새 글 수집 (Step 1 → 2 → 3 → 3.5)
+# ──────────────────────────────────────────────
 async def process_single_url(url: str) -> str:
-    """
-    단일 URL에 대해 3-Step 파이프라인을 수행합니다.
-
-    Returns:
-        결과 상태 문자열: "success", "skipped_duplicate", "failed_*"
-    """
+    """단일 URL에 대해 수집 파이프라인을 수행합니다."""
     logger.info(f"{'='*60}")
     logger.info(f"처리 시작: {url}")
     logger.info(f"{'='*60}")
 
-    # ── Step 0: 중복 체크 (Jina/Gemini 호출 전 선행) ──
+    # ── Step 0: 중복 체크 ──
     try:
         is_dup = await check_duplicate(url)
         if is_dup:
@@ -107,21 +119,81 @@ async def process_single_url(url: str) -> str:
         return "skipped_duplicate"
 
     logger.info(f"[Step 3] [OK] Notion 적재 완료 (Page ID: {page_id})")
+
+    # ── Step 3.5: 한글 브리핑 생성 ──
+    try:
+        briefing = await generate_briefing(insight)
+        if briefing:
+            await update_briefing(page_id, briefing)
+            logger.info(f"[Step 3.5] [OK] 한글 브리핑 업데이트 완료")
+        else:
+            logger.warning(f"[Step 3.5] 한글 브리핑 생성 실패. 건너뜀.")
+    except Exception as e:
+        logger.warning(f"[Step 3.5] 한글 브리핑 실패 (치명적 아님): {e}")
+
     return "success"
 
 
-async def run_pipeline(urls: list[str]) -> None:
-    """
-    URL 리스트에 대해 순차적으로 파이프라인을 실행하고 결과를 요약합니다.
-    """
-    if not urls:
-        logger.error("처리할 URL이 없습니다. urls.yaml 또는 --urls 인자를 확인해주세요.")
-        return
+# ──────────────────────────────────────────────
+# Phase B: 코멘트 작성된 글 → 영문 초안 생성
+# ──────────────────────────────────────────────
+async def process_ready_drafts() -> dict[str, int]:
+    """Notion에서 ready 상태 페이지를 찾아 영문 초안을 생성합니다."""
+    logger.info(f"\n{'='*60}")
+    logger.info("Phase B: 코멘트 작성 완료 글 → 영문 초안 생성")
+    logger.info(f"{'='*60}")
 
-    logger.info(f">> aidaily 파이프라인 시작 -- 총 {len(urls)}개 URL")
-    logger.info("")
+    results = {"draft_success": 0, "draft_failed": 0}
 
-    results: dict[str, int] = {
+    ready_pages = await fetch_ready_pages()
+    if not ready_pages:
+        logger.info("[Phase B] ready 상태 글이 없습니다.")
+        return results
+
+    for page in ready_pages:
+        title = page["title"]
+        logger.info(f"\n[Draft] 초안 생성 시작: '{title}'")
+
+        # 본문에서 인사이트 정보 읽기
+        body_text = await fetch_page_blocks(page["page_id"])
+
+        # ArticleInsight 재구성 (속성 + 본문 텍스트)
+        insight = ArticleInsight(
+            title=page["title"],
+            author=page["author"],
+            benchmarks=[line.strip() for line in body_text.split("\n") if line.strip()],
+            business_impact=body_text[-500:] if body_text else "",
+        )
+
+        try:
+            draft = await compose_draft(insight, page["my_take_kr"])
+        except Exception as e:
+            logger.error(f"[Draft] 초안 생성 실패: {e}")
+            results["draft_failed"] += 1
+            continue
+
+        if not draft:
+            results["draft_failed"] += 1
+            continue
+
+        # Notion 본문에 초안 저장
+        saved = await save_draft_to_page(page["page_id"], draft)
+        if saved:
+            logger.info(f"[Draft] [OK] 초안 저장 완료: '{draft.title}' ({len(draft.body_markdown.split())} words)")
+            results["draft_success"] += 1
+        else:
+            results["draft_failed"] += 1
+
+    return results
+
+
+# ──────────────────────────────────────────────
+# 파이프라인 실행
+# ──────────────────────────────────────────────
+async def run_pipeline(urls: list[str], draft_only: bool = False) -> None:
+    """Phase A + Phase B를 순차 실행합니다."""
+
+    phase_a_results: dict[str, int] = {
         "success": 0,
         "skipped_duplicate": 0,
         "failed_scraping": 0,
@@ -129,35 +201,48 @@ async def run_pipeline(urls: list[str]) -> None:
         "failed_publishing": 0,
     }
 
-    for i, url in enumerate(urls, 1):
-        logger.info(f"\n[{i}/{len(urls)}] 처리 중...")
-        status = await process_single_url(url)
-        results[status] = results.get(status, 0) + 1
+    # ── Phase A: 새 글 수집 ──
+    if not draft_only:
+        if not urls:
+            logger.info("Phase A: 처리할 URL이 없습니다. Phase B로 진행합니다.")
+        else:
+            logger.info(f">> Phase A: 새 글 수집 시작 -- 총 {len(urls)}개 URL")
+            logger.info("")
 
-        # Rate Limit 방지: 다음 URL 전 딜레이
-        if i < len(urls):
-            logger.info(
-                f"[WAIT] Rate Limit 방지 대기: {REQUEST_DELAY_SECONDS}초..."
-            )
-            await asyncio.sleep(REQUEST_DELAY_SECONDS)
+            for i, url in enumerate(urls, 1):
+                logger.info(f"\n[{i}/{len(urls)}] 처리 중...")
+                status = await process_single_url(url)
+                phase_a_results[status] = phase_a_results.get(status, 0) + 1
+
+                if i < len(urls):
+                    logger.info(f"[WAIT] Rate Limit 방지 대기: {REQUEST_DELAY_SECONDS}초...")
+                    await asyncio.sleep(REQUEST_DELAY_SECONDS)
+
+    # ── Phase B: 초안 생성 ──
+    phase_b_results = await process_ready_drafts()
 
     # ── 결과 요약 ──
     logger.info(f"\n{'='*60}")
     logger.info("파이프라인 실행 결과 요약")
     logger.info(f"{'='*60}")
-    logger.info(f"  [OK]   성공 (Notion 적재):  {results['success']}건")
-    logger.info(f"  [SKIP] 스킵 (중복):         {results['skipped_duplicate']}건")
-    logger.info(f"  [FAIL] 실패 (스크래핑):     {results['failed_scraping']}건")
-    logger.info(f"  [FAIL] 실패 (Gemini 추출):  {results['failed_extraction']}건")
-    logger.info(f"  [FAIL] 실패 (Notion 적재):  {results['failed_publishing']}건")
+
+    if not draft_only:
+        logger.info(f"  [Phase A] 새 글 수집:")
+        logger.info(f"    [OK]   성공:        {phase_a_results['success']}건")
+        logger.info(f"    [SKIP] 중복 스킵:   {phase_a_results['skipped_duplicate']}건")
+        logger.info(f"    [FAIL] 스크래핑:    {phase_a_results['failed_scraping']}건")
+        logger.info(f"    [FAIL] Gemini:      {phase_a_results['failed_extraction']}건")
+        logger.info(f"    [FAIL] Notion:      {phase_a_results['failed_publishing']}건")
+
+    logger.info(f"  [Phase B] 초안 생성:")
+    logger.info(f"    [OK]   성공:        {phase_b_results['draft_success']}건")
+    logger.info(f"    [FAIL] 실패:        {phase_b_results['draft_failed']}건")
     logger.info(f"{'='*60}")
-    total = sum(results.values())
-    logger.info(f"  총: {total}건 처리 완료")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="aidaily — AI 뉴스 파싱 및 Notion 자동 적재 파이프라인"
+        description="aidaily — AI 뉴스 수집 + 영문 초안 생성 파이프라인"
     )
     parser.add_argument(
         "--urls",
@@ -169,22 +254,26 @@ def main():
         default="urls.yaml",
         help="URL 리스트 YAML 파일 경로 (기본값: urls.yaml)",
     )
+    parser.add_argument(
+        "--draft-only",
+        action="store_true",
+        help="Phase B만 실행 (코멘트된 글 초안 생성만)",
+    )
     args = parser.parse_args()
 
-    # 환경변수 검증
     validate_env()
 
-    # URL 리스트 결정
-    if args.urls:
-        urls = args.urls
-        logger.info(f"CLI 인자에서 {len(urls)}개 URL 로드")
-    else:
-        urls = load_urls_from_yaml(args.file)
-        if urls:
-            logger.info(f"{args.file}에서 {len(urls)}개 URL 로드")
+    urls: list[str] = []
+    if not args.draft_only:
+        if args.urls:
+            urls = args.urls
+            logger.info(f"CLI 인자에서 {len(urls)}개 URL 로드")
+        else:
+            urls = load_urls_from_yaml(args.file)
+            if urls:
+                logger.info(f"{args.file}에서 {len(urls)}개 URL 로드")
 
-    # 파이프라인 실행
-    asyncio.run(run_pipeline(urls))
+    asyncio.run(run_pipeline(urls, draft_only=args.draft_only))
 
 
 if __name__ == "__main__":
